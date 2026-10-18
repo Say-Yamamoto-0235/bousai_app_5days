@@ -36,6 +36,17 @@
   .location-help { margin: 12px 0 8px; color: #68788a; font-size: 13px; }
   #locationPicker { height: 320px; border-radius: 6px; background: #e3edf0; }
   .location-picker-status { margin: 8px 0 0; color: #287447; font-size: 13px; }
+  .location-search { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, .7fr) auto; gap: 10px; align-items: end; margin: 12px 0; }
+  .location-search label { display: grid; gap: 6px; color: #536579; font-size: 13px; font-weight: 600; }
+  .location-search input { min-width: 0; min-height: 40px; padding: 8px 10px; border: 1px solid #cbd5df; border-radius: 5px; font: inherit; }
+  .location-search-results { display: grid; gap: 8px; margin: 12px 0; }
+  .location-candidate { width: 100%; padding: 11px 12px; border: 1px solid #d9e1e8; border-radius: 5px; background: #fff; color: #263548; text-align: left; cursor: pointer; }
+  .location-candidate:hover,
+  .location-candidate:focus-visible,
+  .location-candidate.is-selected { border-color: #2c5ca8; background: #f1f6fc; }
+  .location-candidate strong,
+  .location-candidate span { display: block; }
+  .location-candidate span { margin-top: 4px; color: #68788a; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
   .admin-actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
   .admin-button {
     min-height: 40px;
@@ -69,6 +80,7 @@
     .shelter-form-grid .full-width { grid-column: auto; }
     #locationPicker { height: 280px; }
     .shelter-edit-title { align-items: flex-start; flex-direction: column; gap: 4px; }
+    .location-search { grid-template-columns: 1fr; }
   }
 </style>
 
@@ -107,9 +119,19 @@
           </select>
         </label>
       </div>
-      <p class="location-help">地図をクリックすると、その地点の緯度・経度が入力されます。</p>
+      <div class="location-search" role="search" aria-label="施設名・住所から位置を検索">
+        <label for="locationSearchQuery">施設名または住所
+          <input id="locationSearchQuery" type="search" placeholder="例: 片瀬小学校">
+        </label>
+        <label for="locationSearchRegion">検索する地域
+          <input id="locationSearchRegion" type="text" value="神奈川県藤沢市">
+        </label>
+        <button class="admin-button admin-button--secondary" id="searchLocationButton" type="button">候補を検索</button>
+      </div>
+      <p class="location-help">候補を検索して地図上の位置を確認するか、地図をクリックして指定できます。</p>
       <div id="locationPicker" aria-label="避難所の位置を選択する地図"></div>
       <p class="location-picker-status" id="locationPickerStatus" aria-live="polite">地図上をクリックして位置を指定してください。</p>
+      <div class="location-search-results" id="locationSearchResults" aria-live="polite"></div>
       <div class="admin-actions"><button class="admin-button" type="submit">避難所を登録</button></div>
     </form>
   </section>
@@ -168,15 +190,99 @@ document.addEventListener('DOMContentLoaded', function() {
   const newLatitude = document.getElementById('latitude');
   const newLongitude = document.getElementById('longitude');
   const status = document.getElementById('locationPickerStatus');
+  const searchQuery = document.getElementById('locationSearchQuery');
+  const searchRegion = document.getElementById('locationSearchRegion');
+  const searchButton = document.getElementById('searchLocationButton');
+  const searchResults = document.getElementById('locationSearchResults');
+  const candidateLayer = L.layerGroup().addTo(locationMap);
   let activeLatitude = newLatitude;
   let activeLongitude = newLongitude;
   let selectedMarker;
+
+  document.getElementById('name').addEventListener('input', function() {
+    if (activeLatitude === newLatitude) searchQuery.value = this.value;
+  });
+
+  searchButton.addEventListener('click', async function() {
+    const query = searchQuery.value.trim();
+    if (!query) {
+      status.textContent = '施設名または住所を入力してください。';
+      searchQuery.focus();
+      return;
+    }
+
+    searchButton.disabled = true;
+    searchResults.replaceChildren();
+    candidateLayer.clearLayers();
+    status.textContent = '位置候補を検索しています...';
+
+    try {
+      const parameters = new URLSearchParams({ q: query, region: searchRegion.value.trim() });
+      const response = await fetch(`/api/shelter_location_search?${parameters}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '位置を検索できませんでした。');
+      if (!data.results.length) {
+        status.textContent = '候補が見つかりませんでした。別の施設名・住所でもお試しください。';
+        return;
+      }
+
+      const candidateBounds = [];
+      data.results.forEach((candidate, index) => {
+        const coordinates = [candidate.latitude, candidate.longitude];
+        const marker = L.marker(coordinates).bindPopup(candidate.name).addTo(candidateLayer);
+        candidateBounds.push(coordinates);
+
+        const candidateButton = document.createElement('button');
+        candidateButton.type = 'button';
+        candidateButton.className = 'location-candidate';
+        const name = document.createElement('strong');
+        name.textContent = `${index + 1}. ${candidate.name}`;
+        const address = document.createElement('span');
+        address.textContent = candidate.address;
+        candidateButton.append(name, address);
+        candidateButton.addEventListener('click', function() {
+          activeLatitude.value = candidate.latitude.toFixed(6);
+          activeLongitude.value = candidate.longitude.toFixed(6);
+          document.querySelectorAll('.location-candidate').forEach(button => button.classList.remove('is-selected'));
+          candidateButton.classList.add('is-selected');
+          locationMap.setView(coordinates, 16);
+          marker.openPopup();
+          selectedMarker = marker;
+          status.textContent = `候補を選択しました: ${candidate.name}（${candidate.address}）`;
+        });
+        marker.on('click', function() {
+          candidateButton.focus();
+        });
+        searchResults.append(candidateButton);
+      });
+
+      if (candidateBounds.length === 1) locationMap.setView(candidateBounds[0], 15);
+      if (candidateBounds.length > 1) locationMap.fitBounds(candidateBounds, { padding: [24, 24] });
+      status.textContent = `${data.results.length}件の候補を地図に表示しました。場所を確認して候補を選択してください。`;
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      searchButton.disabled = false;
+    }
+  });
 
   document.querySelectorAll('.pick-shelter-location').forEach(button => {
     button.addEventListener('click', function() {
       const form = document.getElementById(button.dataset.form);
       activeLatitude = form.querySelector('.latitude-input');
       activeLongitude = form.querySelector('.longitude-input');
+      searchQuery.value = form.closest('.shelter-edit-item').querySelector('h4').textContent;
+      const latitude = Number(activeLatitude.value);
+      const longitude = Number(activeLongitude.value);
+      if (selectedMarker) selectedMarker.remove();
+      candidateLayer.clearLayers();
+      searchResults.replaceChildren();
+      if (activeLatitude.value && activeLongitude.value
+          && Number.isFinite(latitude) && Number.isFinite(longitude)) {
+        const currentLocation = [latitude, longitude];
+        locationMap.setView(currentLocation, 15);
+        selectedMarker = L.marker(currentLocation).addTo(locationMap);
+      }
       status.textContent = `${form.closest('.shelter-edit-item').querySelector('h4').textContent}の位置を地図で指定してください。`;
       document.getElementById('locationPicker').scrollIntoView({ behavior: 'smooth', block: 'center' });
     });

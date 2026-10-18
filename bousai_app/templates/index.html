@@ -72,6 +72,24 @@
     .shelter-map-swatch--unknown { background: #c58a28; }
     .shelter-map-summary { margin: 0; color: #68788a; font-size: 12px; text-align: right; }
 
+    .shelter-map-marker {
+        width: 30px !important;
+        height: 36px !important;
+        border: 0 !important;
+        background: transparent !important;
+    }
+
+    .shelter-map-pin {
+        display: block;
+        width: 30px;
+        height: 36px;
+        filter: drop-shadow(0 2px 2px rgb(24 43 64 / 35%));
+    }
+
+    .shelter-map-marker--open { color: #278b4c; }
+    .shelter-map-marker--closed { color: #778493; }
+    .shelter-map-marker--unknown { color: #c58a28; }
+
     .refresh-note {
         display: flex;
         align-items: center;
@@ -452,13 +470,15 @@ document.addEventListener('DOMContentLoaded', function() {
 
         const isOpen = shelter.status === '開設中';
         const isClosed = shelter.status === '未開設';
-        const color = isOpen ? '#278b4c' : isClosed ? '#778493' : '#c58a28';
-        const marker = L.circleMarker([latitude, longitude], {
-            radius: 9,
-            color: '#fff',
-            weight: 2,
-            fillColor: color,
-            fillOpacity: 1
+        const markerStatus = isOpen ? 'open' : isClosed ? 'closed' : 'unknown';
+        const marker = L.marker([latitude, longitude], {
+            icon: L.divIcon({
+                className: `shelter-map-marker shelter-map-marker--${markerStatus}`,
+                html: '<svg class="shelter-map-pin" aria-hidden="true"><use href="#ui-map-pin"></use></svg>',
+                iconSize: [30, 36],
+                iconAnchor: [15, 34],
+                popupAnchor: [0, -32]
+            })
         }).addTo(map);
 
         const popup = document.createElement('div');

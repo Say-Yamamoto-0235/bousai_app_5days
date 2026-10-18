@@ -1,8 +1,11 @@
 from flask import Flask, flash, jsonify, request, render_template, session, redirect, url_for
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlencode
 from functools import wraps
 import json
+import math
 import os
+import threading
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -30,6 +33,12 @@ AREA_NAME = "青森市"
 
 # 青森市の市区町村コード
 AREA_CODE = "0220100"
+GEOCODING_URL = "https://nominatim.openstreetmap.org/search"
+GSI_GEOCODING_URL = "https://msearch.gsi.go.jp/address-search/AddressSearch"
+GEOCODING_CACHE = {}
+GEOCODING_REGION_CACHE = {}
+GEOCODING_LOCK = threading.Lock()
+LAST_GEOCODING_REQUEST = 0.0
 
 WARNING_URL = (
     f"https://www.jma.go.jp/bosai/warning/data/r8/{PREFECTURE_CODE}.json"
@@ -160,6 +169,169 @@ def format_report_time(iso_str):
 def filter_shelters(district=None):
     """district 指定があれば一致する避難所のみ、なければ全件を返す"""
     return [s for s in shelters if not district or s.get('district') == district]
+
+
+def search_shelter_locations(query, region):
+    """国土地理院を優先し、施設名・住所の候補地点を検索する"""
+    global LAST_GEOCODING_REQUEST
+    normalized_query = " ".join(f"{region} {query}".split())
+    cache_key = normalized_query.casefold()
+    if cache_key in GEOCODING_CACHE:
+        return GEOCODING_CACHE[cache_key]
+
+    gsi_parameters = urlencode({"q": query})
+    with GEOCODING_LOCK:
+        wait_time = 1.1 - (time.monotonic() - LAST_GEOCODING_REQUEST)
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+        gsi_request = urllib.request.Request(
+            f"{GSI_GEOCODING_URL}?{gsi_parameters}",
+            headers={"User-Agent": "bousai-app/1.0 (shelter location search)"}
+        )
+        try:
+            with urllib.request.urlopen(gsi_request, timeout=10) as response:
+                gsi_results = json.loads(response.read())
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            gsi_results = []
+        LAST_GEOCODING_REQUEST = time.monotonic()
+
+        results = []
+        if isinstance(gsi_results, list):
+            for result in gsi_results:
+                if not isinstance(result, dict):
+                    continue
+                properties = result.get("properties", {})
+                coordinates = result.get("geometry", {}).get("coordinates", [])
+                if not isinstance(properties, dict) or len(coordinates) < 2:
+                    continue
+                try:
+                    longitude, latitude = float(coordinates[0]), float(coordinates[1])
+                except (TypeError, ValueError):
+                    continue
+                if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                    continue
+                results.append({
+                    "name": properties.get("title", "検索候補"),
+                    "address": "国土地理院地名検索",
+                    "latitude": latitude,
+                    "longitude": longitude
+                })
+
+        region_key = region.casefold()
+        region_anchor = GEOCODING_REGION_CACHE.get(region_key)
+        if region and region_anchor is None:
+            wait_time = 1.1 - (time.monotonic() - LAST_GEOCODING_REQUEST)
+            if wait_time > 0:
+                time.sleep(wait_time)
+            region_request = urllib.request.Request(
+                f"{GSI_GEOCODING_URL}?{urlencode({'q': region})}",
+                headers={"User-Agent": "bousai-app/1.0 (shelter location search)"}
+            )
+            try:
+                with urllib.request.urlopen(region_request, timeout=10) as response:
+                    region_results = json.loads(response.read())
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+                region_results = []
+            LAST_GEOCODING_REQUEST = time.monotonic()
+
+            if isinstance(region_results, list):
+                region_anchor = next((
+                    (
+                        float(item["geometry"]["coordinates"][1]),
+                        float(item["geometry"]["coordinates"][0])
+                    )
+                    for item in region_results
+                    if isinstance(item, dict)
+                    and isinstance(item.get("properties"), dict)
+                    and region in item["properties"].get("title", "")
+                    and len(item.get("geometry", {}).get("coordinates", [])) >= 2
+                ), None)
+                if region_anchor:
+                    GEOCODING_REGION_CACHE[region_key] = region_anchor
+
+        if region_anchor:
+            for result in results:
+                latitude_delta = math.radians(result["latitude"] - region_anchor[0])
+                longitude_delta = math.radians(result["longitude"] - region_anchor[1])
+                start_latitude = math.radians(region_anchor[0])
+                end_latitude = math.radians(result["latitude"])
+                distance = 6371 * 2 * math.asin(math.sqrt(
+                    math.sin(latitude_delta / 2) ** 2
+                    + math.cos(start_latitude) * math.cos(end_latitude)
+                    * math.sin(longitude_delta / 2) ** 2
+                ))
+                result["distance_km"] = round(distance, 1)
+                result["address"] = f"検索地域から約{distance:.1f}km / {result['address']}"
+            results.sort(key=lambda result: result.get("distance_km", float("inf")))
+            nearby_results = [result for result in results if result.get("distance_km", 0) <= 50]
+            if nearby_results:
+                results = nearby_results[:5]
+            else:
+                results = []
+
+        if not results:
+            wait_time = 1.1 - (time.monotonic() - LAST_GEOCODING_REQUEST)
+            if wait_time > 0:
+                time.sleep(wait_time)
+            nominatim_parameters = urlencode({
+                "q": normalized_query,
+                "format": "jsonv2",
+                "limit": 5,
+                "addressdetails": 1,
+                "countrycodes": "jp",
+                "accept-language": "ja"
+            })
+            nominatim_request = urllib.request.Request(
+                f"{GEOCODING_URL}?{nominatim_parameters}",
+                headers={"User-Agent": "bousai-app/1.0 (shelter location search)"}
+            )
+            with urllib.request.urlopen(nominatim_request, timeout=10) as response:
+                nominatim_results = json.loads(response.read())
+            LAST_GEOCODING_REQUEST = time.monotonic()
+
+            if isinstance(nominatim_results, list):
+                for result in nominatim_results:
+                    if not isinstance(result, dict):
+                        continue
+                    try:
+                        latitude = float(result["lat"])
+                        longitude = float(result["lon"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                        continue
+                    results.append({
+                        "name": result.get("name") or result.get("display_name", "検索候補").split(",")[0],
+                        "address": result.get("display_name", "住所情報なし"),
+                        "latitude": latitude,
+                        "longitude": longitude
+                    })
+
+            if region_anchor:
+                for result in results:
+                    latitude_delta = math.radians(result["latitude"] - region_anchor[0])
+                    longitude_delta = math.radians(result["longitude"] - region_anchor[1])
+                    start_latitude = math.radians(region_anchor[0])
+                    end_latitude = math.radians(result["latitude"])
+                    distance = 6371 * 2 * math.asin(math.sqrt(
+                        math.sin(latitude_delta / 2) ** 2
+                        + math.cos(start_latitude) * math.cos(end_latitude)
+                        * math.sin(longitude_delta / 2) ** 2
+                    ))
+                    result["distance_km"] = round(distance, 1)
+                    result["address"] = f"検索地域から約{distance:.1f}km / {result['address']}"
+                results.sort(key=lambda result: result.get("distance_km", float("inf")))
+                nearby_results = [result for result in results if result.get("distance_km", 0) <= 50]
+                if nearby_results:
+                    results = nearby_results[:5]
+                else:
+                    results = []
+
+    if len(GEOCODING_CACHE) >= 100:
+        GEOCODING_CACHE.pop(next(iter(GEOCODING_CACHE)))
+    GEOCODING_CACHE[cache_key] = results
+    return results
 
 
 def parse_area_warnings(warning_data):
@@ -540,6 +712,23 @@ def get_shelters():
 def api_weather_warnings():
     """気象警報・注意報をJSON形式で返すAPI"""
     return jsonify(get_weather_warnings())
+
+
+@app.route('/api/shelter_location_search')
+@login_required
+def api_shelter_location_search():
+    """避難所名・住所から地図上の候補地点を検索する"""
+    query = request.args.get('q', '').strip()
+    region = request.args.get('region', '').strip()
+    if not query or len(query) > 160 or len(region) > 100:
+        return jsonify({'error': '検索する施設名・住所を入力してください。'}), 400
+
+    try:
+        results = search_shelter_locations(query, region)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return jsonify({'error': '位置検索サービスに接続できませんでした。'}), 502
+
+    return jsonify({'results': results})
 
 # 災害情報一覧API
 @app.route('/api/disaster_information')
