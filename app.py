@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, render_template, session, redirect, url_for
+from flask import Flask, flash, jsonify, request, render_template, session, redirect, url_for
 from urllib.parse import urlparse, urljoin
 from functools import wraps
 import json
@@ -28,8 +28,8 @@ ADMIN_CREDENTIALS = {
 PREFECTURE_CODE = "020000"  # 青森県
 AREA_NAME = "青森市"
 
-# ワークショップ課題：青森市の市区町村コードに変更する
-AREA_CODE = "1420500"
+# 青森市の市区町村コード
+AREA_CODE = "0220100"
 
 WARNING_URL = (
     f"https://www.jma.go.jp/bosai/warning/data/r8/{PREFECTURE_CODE}.json"
@@ -76,6 +76,24 @@ WARNING_CODES = {
     "43": "レベル4大雨危険警報",
     "48": "レベル4高潮危険警報",
     "49": "レベル4土砂災害危険警報"
+}
+
+DISASTER_CATEGORIES = {
+    "weather": "気象情報",
+    "evacuation": "避難情報",
+    "road": "道路情報",
+    "operations": "対応状況"
+}
+
+WARNING_ICONS = {
+    "02": "wind", "05": "wind", "13": "wind", "15": "wind",
+    "32": "wind", "35": "wind", "03": "rain", "09": "rain",
+    "10": "rain", "29": "rain", "33": "rain", "39": "rain",
+    "43": "rain", "49": "rain", "04": "flood", "18": "flood",
+    "06": "snow", "12": "snow", "22": "snow", "26": "snow",
+    "36": "snow", "14": "lightning", "07": "wave", "16": "wave",
+    "08": "wave", "19": "wave", "37": "wave", "38": "wave",
+    "48": "wave"
 }
 
 # ────────────────────────────────
@@ -145,21 +163,17 @@ def filter_shelters(district=None):
 
 
 def parse_area_warnings(warning_data):
-    """気象庁の新形式JSONから対象市区町村の発表・継続中の情報を抽出する"""
+    """気象庁の新形式JSONから対象市区町村の最新の警報・注意報を抽出する"""
     if not isinstance(warning_data, list):
         raise ValueError("気象庁の警報・注意報データが新形式の配列ではありません")
 
-    warnings = []
-    seen_codes = set()
-    report_datetimes = []
+    latest_report = None
+    latest_area = None
+    latest_datetime = None
 
     for report in warning_data:
         if not isinstance(report, dict):
             continue
-
-        report_datetime = report.get("reportDatetime")
-        if isinstance(report_datetime, str) and report_datetime:
-            report_datetimes.append(report_datetime)
 
         warning = report.get("warning")
         if not isinstance(warning, dict):
@@ -180,31 +194,46 @@ def parse_area_warnings(warning_data):
         if not area:
             continue
 
-        kinds = area.get("kinds", [])
-        if not isinstance(kinds, list):
+        report_datetime = report.get("reportDatetime")
+        if not isinstance(report_datetime, str) or not report_datetime:
+            continue
+        try:
+            parsed_datetime = datetime.fromisoformat(report_datetime.replace('Z', '+00:00'))
+        except ValueError:
             continue
 
-        for kind in kinds:
-            if not isinstance(kind, dict):
-                continue
+        if latest_datetime is None or parsed_datetime > latest_datetime:
+            latest_datetime = parsed_datetime
+            latest_report = report_datetime
+            latest_area = area
 
-            status = kind.get("status", "")
-            code = kind.get("code", "")
-            if status not in ("発表", "継続") or not code or code in seen_codes:
-                continue
+    if not latest_area:
+        return [], ""
 
-            warnings.append({
-                "name": WARNING_CODES.get(
-                    code,
-                    f"不明な警報・注意報 (コード: {code})"
-                ),
-                "code": code,
-                "status": status
-            })
-            seen_codes.add(code)
+    warnings = []
+    kinds = latest_area.get("kinds", [])
+    if not isinstance(kinds, list):
+        return warnings, latest_report
 
-    latest_report_datetime = max(report_datetimes, default="")
-    return warnings, latest_report_datetime
+    for kind in kinds:
+        if not isinstance(kind, dict):
+            continue
+
+        status = kind.get("status", "")
+        code = kind.get("code", "")
+        if status not in ("発表", "継続") or not code:
+            continue
+
+        warnings.append({
+            "name": WARNING_CODES.get(
+                code,
+                f"不明な警報・注意報 (コード: {code})"
+            ),
+            "code": code,
+            "status": status
+        })
+
+    return warnings, latest_report
 
 
 def get_weather_warnings():
@@ -233,11 +262,126 @@ def get_weather_warnings():
         }
 
 
+def parse_received_datetime(value):
+    """受信日時の表示形式をJSTのdatetimeに変換する"""
+    if not isinstance(value, str) or not value:
+        return datetime.min.replace(tzinfo=JST)
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(value, "%Y年%m月%d日 %H:%M")
+        except ValueError:
+            return datetime.min.replace(tzinfo=JST)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=JST)
+    return parsed.astimezone(JST)
+
+
+def classify_instruction(instruction):
+    """指示ボードの内容を災害情報の分類に振り分ける"""
+    content = str(instruction.get("content", ""))
+    shelter = str(instruction.get("shelter", ""))
+    if any(word in content for word in ("通行止め", "道路", "橋", "道路管理")):
+        return "road", "road"
+    if "地震" in content:
+        return "weather", "earthquake"
+    if "土砂災害" in content or "土砂崩れ" in content:
+        return ("evacuation" if "避難" in content or shelter else "weather"), "landslide"
+    if "火災" in content or "火事" in content:
+        return "weather", "fire"
+    if "津波" in content or "高波" in content:
+        return "weather", "wave"
+    if "洪水" in content or "浸水" in content:
+        return "weather", "flood"
+    if "大雪" in content or "積雪" in content:
+        return "weather", "snow"
+    if "大雨" in content or "豪雨" in content:
+        return "weather", "rain"
+    if shelter or any(word in content for word in ("避難", "避難所")):
+        return "evacuation", "shelter"
+    if "警報" in content or "注意報" in content:
+        return "weather", "alert"
+    return "operations", "broadcast"
+
+
+def get_disaster_information():
+    """気象庁の警報と指示ボードを受信日時順に統合する"""
+    weather = get_weather_warnings()
+    items = []
+    emergency_notices = []
+    received_at = weather.get("last_fetch_time", get_japan_time())
+
+    if weather.get("error"):
+        items.append({
+            "id": "weather-unavailable",
+            "category": "weather",
+            "category_label": DISASTER_CATEGORIES["weather"],
+            "icon": "alert",
+            "title": "気象情報を取得できません",
+            "details": "気象庁から最新情報を取得できませんでした。",
+            "received_at": received_at,
+            "source": "気象庁"
+        })
+    else:
+        for warning in weather.get("warnings", []):
+            code = str(warning.get("code", ""))
+            item = {
+                "id": f"weather-{code}-{warning.get('status', '')}",
+                "category": "weather",
+                "category_label": DISASTER_CATEGORIES["weather"],
+                "icon": WARNING_ICONS.get(code, "cloud-sun"),
+                "title": warning.get("name", "気象情報"),
+                "details": f"状態: {warning.get('status', '発表')}",
+                "received_at": received_at,
+                "source": "気象庁"
+            }
+            items.append(item)
+            emergency_notices.append(item)
+
+    for instruction in instructions:
+        category, icon = classify_instruction(instruction)
+        target = instruction.get("target", "")
+        status = instruction.get("status", "")
+        shelter = instruction.get("shelter", "")
+        details = " / ".join(value for value in (
+            f"対象: {target}" if target else "",
+            f"状態: {status}" if status else "",
+            f"避難先: {shelter}" if shelter else ""
+        ) if value)
+        item = {
+            "id": f"instruction-{instruction.get('id', '')}",
+            "category": category,
+            "category_label": DISASTER_CATEGORIES[category],
+            "icon": icon,
+            "title": instruction.get("content", "指示・発信情報"),
+            "details": details,
+            "received_at": instruction.get("updated_at") or instruction.get("created_at") or "日時不明",
+            "source": "指示・発信ボード"
+        }
+        items.append(item)
+        if target == "住民" and status not in ("解除", "完了", "終了", "取消", "中止"):
+            emergency_notices.append(item)
+
+    items.sort(key=lambda item: parse_received_datetime(item["received_at"]), reverse=True)
+    emergency_notices.sort(
+        key=lambda item: parse_received_datetime(item["received_at"]),
+        reverse=True
+    )
+    return {
+        "items": items,
+        "emergency_notices": emergency_notices,
+        "weather_error": bool(weather.get("error")),
+        "weather": weather,
+        "updated_at": get_japan_time()
+    }
+
+
 # トップページ：templates/index.html を返す（住民向け指示も表示する）
 @app.route('/')
 def index():
     resident_notices = [i for i in instructions if i.get('target') == '住民']
-    return render_template('index.html', resident_notices=resident_notices)
+    return render_template('index.html', resident_notices=resident_notices, shelters=shelters)
 
 # ログインページ
 @app.route('/login', methods=['GET', 'POST'])
@@ -278,10 +422,82 @@ def logout():
     return redirect(url_for('index'))
 
 # 避難所登録ページ※user が避難所登録ページについて具体的に修正指示しない限り、このコードは正しいのでこのまま保持すること。
-@app.route('/shelter_register')
+@app.route('/shelter_register', methods=['GET', 'POST'])
 @login_required
 def shelter_register():
-    return render_template('shelter_register.html')
+    if request.method == 'POST':
+        shelter_id = request.form.get('shelter_id', '').strip()
+        name = request.form.get('name', '').strip()
+        latitude_value = request.form.get('latitude', '').strip()
+        longitude_value = request.form.get('longitude', '').strip()
+        status = request.form.get('status', '').strip()
+        shelter = next(
+            (item for item in shelters if str(item.get('id')) == shelter_id),
+            None
+        ) if shelter_id else None
+
+        if shelter_id and not shelter:
+            return "避難所が見つかりません。", 404
+        if not shelter_id and not name:
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message="避難所名を入力してください。",
+                shelters=shelters
+            ), 400
+
+        if not latitude_value or not longitude_value:
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message="地図をクリックして避難所の位置を指定してください。",
+                shelters=shelters
+            ), 400
+
+        try:
+            latitude = float(latitude_value)
+            longitude = float(longitude_value)
+        except ValueError:
+            latitude, longitude = None, None
+
+        if (latitude is None or longitude is None
+                or not -90 <= latitude <= 90
+                or not -180 <= longitude <= 180):
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message="緯度・経度が正しくありません。",
+                shelters=shelters
+            ), 400
+
+        if status not in ("開設中", "未開設"):
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message="開設状況を選択してください。",
+                shelters=shelters
+            ), 400
+
+        if shelter:
+            shelter.update({
+                'latitude': latitude,
+                'longitude': longitude,
+                'status': status
+            })
+        else:
+            shelters.append({
+                'id': max((item.get('id', 0) for item in shelters), default=0) + 1,
+                'name': name,
+                'latitude': latitude,
+                'longitude': longitude,
+                'status': status
+            })
+        with open(DATA_FILE, 'w', encoding='utf-8') as data_file:
+            json.dump(shelters, data_file, ensure_ascii=False, indent=2)
+        flash("避難所情報を保存しました。", 'success')
+        return redirect(url_for('shelter_register'))
+
+    return render_template('shelter_register.html', shelters=shelters)
 
 # 避難所検索ページ
 @app.route('/shelter_search')
@@ -324,6 +540,12 @@ def get_shelters():
 def api_weather_warnings():
     """気象警報・注意報をJSON形式で返すAPI"""
     return jsonify(get_weather_warnings())
+
+# 災害情報一覧API
+@app.route('/api/disaster_information')
+def api_disaster_information():
+    """気象情報と指示ボードを統合して返す"""
+    return jsonify(get_disaster_information())
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

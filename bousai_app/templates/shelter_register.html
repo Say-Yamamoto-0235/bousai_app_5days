@@ -1,23 +1,194 @@
 {% extends "base.html" %}
 
 {% block content %}
-<h2>避難所登録</h2>
-<p>新しい避難所情報を登録します。</p>
+<style>
+  .shelter-admin {
+    width: min(100% - 32px, 900px);
+    margin: 32px auto 56px;
+  }
 
-<!-- 成功・エラーメッセージ表示 -->
-{% if success %}
-  <p>{{ message }}</p>
-{% endif %}
+  .shelter-admin h2 { margin: 0 0 8px; color: #285da7; }
+  .shelter-admin > p { margin: 0 0 22px; color: #68788a; }
+  .admin-section {
+    margin-bottom: 24px;
+    padding: 22px;
+    border: 1px solid #e8edf2;
+    border-radius: 8px;
+    background: #fff;
+  }
 
-{% if error %}
-  <p>{{ message }}</p>
-{% endif %}
+  .admin-section h3 { margin: 0 0 16px; color: #263548; font-size: 18px; }
+  .shelter-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .shelter-form-grid label { display: grid; gap: 6px; color: #536579; font-size: 14px; font-weight: 600; }
+  .shelter-form-grid input,
+  .shelter-form-grid select {
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 10px;
+    border: 1px solid #cbd5df;
+    border-radius: 5px;
+    background: #fff;
+    color: #263548;
+    font: inherit;
+  }
 
-<form method="POST">
-  <p>
-    <label for="name">避難所名（必須）</label><br>
-    <input type="text" id="name" name="name">
-  </p>
-  <p><button type="submit">登録</button></p>
-</form>
+  .shelter-form-grid .full-width { grid-column: 1 / -1; }
+  .location-help { margin: 12px 0 8px; color: #68788a; font-size: 13px; }
+  #locationPicker { height: 320px; border-radius: 6px; background: #e3edf0; }
+  .location-picker-status { margin: 8px 0 0; color: #287447; font-size: 13px; }
+  .admin-actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+  .admin-button {
+    min-height: 40px;
+    padding: 8px 16px;
+    border: 0;
+    border-radius: 5px;
+    background: #2c5ca8;
+    color: #fff;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .admin-button:hover { background: #234d8d; }
+  .admin-button--secondary { border: 1px solid #cbd5df; background: #fff; color: #285da7; }
+  .admin-button--secondary:hover { background: #eff4fa; }
+  .form-message { margin: 0 0 16px; padding: 10px 12px; border-radius: 5px; }
+  .form-message--success { background: #edf8f0; color: #287447; }
+  .form-message--error { background: #fff1ee; color: #a43f35; }
+  .shelter-edit-list { display: grid; gap: 14px; }
+  .shelter-edit-item { padding: 16px 0; border-top: 1px solid #e8edf2; }
+  .shelter-edit-item:first-child { padding-top: 0; border-top: 0; }
+  .shelter-edit-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .shelter-edit-title h4 { margin: 0; color: #263548; font-size: 16px; }
+  .shelter-status-label { color: #68788a; font-size: 12px; }
+
+  @media (max-width: 640px) {
+    .shelter-admin { margin: 20px auto 40px; }
+    .admin-section { padding: 16px; }
+    .shelter-form-grid { grid-template-columns: 1fr; }
+    .shelter-form-grid .full-width { grid-column: auto; }
+    #locationPicker { height: 280px; }
+    .shelter-edit-title { align-items: flex-start; flex-direction: column; gap: 4px; }
+  }
+</style>
+
+<div class="shelter-admin">
+  <h2>避難所登録・開設状況</h2>
+  <p>施設の位置を地図で指定し、開設状態を登録・更新します。</p>
+
+  {% with messages = get_flashed_messages(category_filter=['success']) %}
+    {% for message in messages %}
+      <p class="form-message form-message--success">{{ message }}</p>
+    {% endfor %}
+  {% endwith %}
+
+  {% if error %}
+    <p class="form-message form-message--error">{{ message }}</p>
+  {% endif %}
+
+  <section class="admin-section" aria-labelledby="new-shelter-heading">
+    <h3 id="new-shelter-heading">新しい避難所を登録</h3>
+    <form method="POST" id="newShelterForm">
+      <div class="shelter-form-grid">
+        <label class="full-width" for="name">避難所名
+          <input type="text" id="name" name="name" required>
+        </label>
+        <label for="latitude">緯度
+          <input class="latitude-input" type="number" id="latitude" name="latitude" min="-90" max="90" step="any" required>
+        </label>
+        <label for="longitude">経度
+          <input class="longitude-input" type="number" id="longitude" name="longitude" min="-180" max="180" step="any" required>
+        </label>
+        <label class="full-width" for="status">開設状況
+          <select id="status" name="status" required>
+            <option value="">選択してください</option>
+            <option value="開設中">開設中</option>
+            <option value="未開設">未開設</option>
+          </select>
+        </label>
+      </div>
+      <p class="location-help">地図をクリックすると、その地点の緯度・経度が入力されます。</p>
+      <div id="locationPicker" aria-label="避難所の位置を選択する地図"></div>
+      <p class="location-picker-status" id="locationPickerStatus" aria-live="polite">地図上をクリックして位置を指定してください。</p>
+      <div class="admin-actions"><button class="admin-button" type="submit">避難所を登録</button></div>
+    </form>
+  </section>
+
+  <section class="admin-section" aria-labelledby="shelter-status-heading">
+    <h3 id="shelter-status-heading">登録済み避難所の位置・開設状況</h3>
+    {% if shelters %}
+      <div class="shelter-edit-list">
+        {% for shelter in shelters %}
+          <article class="shelter-edit-item">
+            <div class="shelter-edit-title">
+              <h4>{{ shelter.name }}</h4>
+              <span class="shelter-status-label">現在: {{ shelter.status or '開設状況未登録' }}{% if not shelter.latitude and shelter.latitude != 0 %}・位置未登録{% endif %}</span>
+            </div>
+            <form method="POST" id="shelterForm{{ shelter.id }}">
+              <input type="hidden" name="shelter_id" value="{{ shelter.id }}">
+              <div class="shelter-form-grid">
+                <label for="latitude{{ shelter.id }}">緯度
+                  <input class="latitude-input" type="number" id="latitude{{ shelter.id }}" name="latitude" value="{{ shelter.latitude if shelter.latitude is not none else '' }}" min="-90" max="90" step="any" required>
+                </label>
+                <label for="longitude{{ shelter.id }}">経度
+                  <input class="longitude-input" type="number" id="longitude{{ shelter.id }}" name="longitude" value="{{ shelter.longitude if shelter.longitude is not none else '' }}" min="-180" max="180" step="any" required>
+                </label>
+                <label class="full-width" for="status{{ shelter.id }}">開設状況
+                  <select id="status{{ shelter.id }}" name="status" required>
+                    <option value="">選択してください</option>
+                    <option value="開設中" {% if shelter.status == '開設中' %}selected{% endif %}>開設中</option>
+                    <option value="未開設" {% if shelter.status == '未開設' %}selected{% endif %}>未開設</option>
+                  </select>
+                </label>
+              </div>
+              <div class="admin-actions">
+                <button class="admin-button admin-button--secondary pick-shelter-location" type="button" data-form="shelterForm{{ shelter.id }}">地図で位置を指定</button>
+                <button class="admin-button" type="submit">情報を更新</button>
+              </div>
+            </form>
+          </article>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p>登録済みの避難所はありません。</p>
+    {% endif %}
+  </section>
+</div>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const locationMap = L.map('locationPicker').setView([35.3390, 139.4903], 11);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors',
+    referrerPolicy: 'strict-origin-when-cross-origin'
+  }).addTo(locationMap);
+
+  const newLatitude = document.getElementById('latitude');
+  const newLongitude = document.getElementById('longitude');
+  const status = document.getElementById('locationPickerStatus');
+  let activeLatitude = newLatitude;
+  let activeLongitude = newLongitude;
+  let selectedMarker;
+
+  document.querySelectorAll('.pick-shelter-location').forEach(button => {
+    button.addEventListener('click', function() {
+      const form = document.getElementById(button.dataset.form);
+      activeLatitude = form.querySelector('.latitude-input');
+      activeLongitude = form.querySelector('.longitude-input');
+      status.textContent = `${form.closest('.shelter-edit-item').querySelector('h4').textContent}の位置を地図で指定してください。`;
+      document.getElementById('locationPicker').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  });
+
+  locationMap.on('click', function(event) {
+    activeLatitude.value = event.latlng.lat.toFixed(6);
+    activeLongitude.value = event.latlng.lng.toFixed(6);
+    if (selectedMarker) selectedMarker.remove();
+    selectedMarker = L.marker(event.latlng).addTo(locationMap);
+    status.textContent = `位置を選択しました: ${activeLatitude.value}, ${activeLongitude.value}`;
+  });
+});
+</script>
 {% endblock %}
